@@ -121,7 +121,8 @@ Handlers automatically deregister when their local catalysts_t scope is destroye
     flux_t::catalysts_t local_pool{local_hub};
 
     temp_handler_t h1{local_pool};
-    nexus.broadcast_t(some_pulse{});
+    nexus.broadcast_t(valve, some_pulse{});
+    valve.drain_t();
 } // h1 deregisters here; the parent nexus/conduits remain active.
 ```
 
