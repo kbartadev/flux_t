@@ -1,4 +1,4 @@
-# flux_t 🌊
+﻿# flux_t 🌊
 A strictly scoped, C++20 RAII-driven concurrency and message-passing runtime.
 
 flux_t is a lightweight, header-only C++20 library designed to simplify multithreaded application design. By modeling execution as a physical topography of RAII-managed objects, it replaces manual start/stop lifecycles and global message buses with a deterministic, type-safe "flow" of data.
@@ -13,30 +13,30 @@ Traditional concurrency is often "unanchored"—relying on global schedulers or 
 ### 2. The Distributed Tissue (Glossary)
 flux_t uses an evocative terminology to describe its internal "anatomy":
 
-* Pulse (Data): The unit of information flowing through the synapse.
-* Vessel (Configuration): The container of potential (Capacity).
-* Conduit (Hardware): The path of execution (Thread).
-* Valve (Control): The regulator of flow (Gatekeeper).
-* Nexus (Routing): The point of convergence and distribution (Synapse).
-* Catalyst (Logic): The "distributed tissue"—handlers that plug into the topography to react to pulses.
+* **Pulse** (Data): The unit of information flowing through the synapse.
+* **Vessel** (Configuration): The container of potential (Capacity).
+* **Conduit** (Hardware): The path of execution (Thread).
+* **Valve** (Control): The regulator of flow (Gatekeeper).
+* **Nexus** (Routing): The point of convergence and distribution (Synapse).
+* **Catalyst** (Logic): The "distributed tissue"—handlers that plug into the topography to react to pulses.
 
 ### 3. Core Architecture
 flux_t relies on a strictly layered hierarchy. Each component owns or references the layer beneath it, ensuring a safe and predictable teardown:
 
-* vessel_t: Defines the requested thread capacity.
-* conduits_t & conduit_internal_t: The engine. conduits_t allocates the worker threads, each managing its own std::thread and mutex-guarded task queue.
-* valve_t: Provides explicit control to toggle flow (open_t, close_t, or drain_t).
-* nexus_t: The central router. It dispatches pulses via O(1) modulo hashing and maintains the handler registry.
-* hub_t & catalysts_t: RAII boundaries that bind message handlers to a specific hierarchical lifetime.
-* reaction_t: User-defined logic. They register with the nexus_t via the catalysts_t scope on construction and deregister on destruction.
+* **vessel_t**: Defines the requested thread capacity.
+* **conduits_t** & **conduit_internal_t**: The engine. conduits_t allocates the worker threads, each managing its own std::thread and mutex-guarded task queue.
+* **valve_t**: Provides explicit control to toggle flow (open_t, close_t, or drain_t).
+* **nexus_t**: The central router. It dispatches pulses via O(1) modulo hashing and maintains the handler registry.
+* **hub_t** & **catalysts_t**: RAII boundaries that bind message handlers to a specific hierarchical lifetime.
+* **reaction_t**: User-defined logic. They register with the nexus_t via the catalysts_t scope on construction and deregister on destruction.
 
 ### 4. Truth in Engineering
 flux_t prioritizes production-ready reliability over experimental "lock-free" complexity:
 
-* Hashing-Based Routing: Target threads are selected via a deterministic hash (hash % conduit_count), ensuring O(1) dispatch and consistent data affinity.
-* Standard Synchronization: Task injection and handler registration are safely guarded by standard std::mutex and std::condition_variable primitives.
-* Low-Latency Wakeups: Worker threads use a 32-iteration spin-loop for fast wakeups before yielding to the OS to avoid unnecessary context switches during high-load bursts.
-* Reliable Teardown: Teardown is managed through explicit draining and RAII. While stack objects follow LIFO (Last-In, First-Out) destruction, elements in internal vectors follow FIFO (First-In, First-Out). The library coordinates these sequences to ensure system safety.
+* **Hashing-Based Routing**: Target threads are selected via a deterministic hash (hash % conduit_count), ensuring O(1) dispatch and consistent data affinity.
+* **Standard Synchronization**: Task injection and handler registration are safely guarded by standard std::mutex and std::condition_variable primitives.
+* **Low-Latency Wakeups**: Worker threads use a 32-iteration spin-loop for fast wakeups before yielding to the OS to avoid unnecessary context switches during high-load bursts.
+* **Reliable Teardown**: Teardown is managed through explicit draining and RAII. While stack objects follow LIFO (Last-In, First-Out) destruction, elements in internal vectors follow FIFO (First-In, First-Out). The library coordinates these sequences to ensure system safety.
 
 ### 5. Design Principles
 flux_t adheres to these strict constraints:
