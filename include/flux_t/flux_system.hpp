@@ -1,5 +1,3 @@
-#pragma once
-
 // MIT License
 // Copyright (c) 2026 Kristof Barta
 //
@@ -20,455 +18,319 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#pragma once
 
 #include <atomic>
-#include <condition_variable>
+#include <thread>
+#include <vector>
 #include <functional>
 #include <memory>
-#include <mutex>
-#include <queue>
-#include <thread>
-#include <tuple>
-#include <typeindex>
-#include <utility>
-#include <vector>
-#include <stdexcept>
+#include <cstdint>
 #include <string>
+#include <mutex>
+#include <condition_variable>
 
-namespace flux_t
-{
+namespace flux_t {
 
     // ============================================================================
-    // 1. CORE DATA PRIMITIVES
+    // 1. FORWARD DECLARATIONS
+    // ============================================================================
+    class nexus_t;
+    struct catalyst_base_t;
+    class valve_t;
+
+    // ============================================================================
+    // 2. BASE PRIMITIVES
     // ============================================================================
 
-    /// Base type for all pulses flowing through the system.
-    struct pulse_base_t
-    {
-        virtual ~pulse_base_t() = default;
-        virtual std::type_index signature_t() const noexcept = 0;
+    template <typename T>
+    struct pulse_t {
+        virtual ~pulse_t() = default;
     };
 
-    /// CRTP pulse: derive from this to define a concrete pulse type.
-    template<typename derived_t>
-    struct pulse_t : pulse_base_t
-    {
-        std::type_index signature_t() const noexcept override
-        {
-            return typeid(derived_t);
-        }
-    };
+    struct catalyst_base_t {
+        std::atomic<bool> is_detached{ false };
 
-    /// Ancestry bundle: references to external resources a reaction depends on.
-    template<typename... requirements_t>
-    struct ancestry_t
-    {
-        std::tuple<requirements_t&...> resources_t;
+        // The base class physically holds its routing link to prevent vtable races.
+        nexus_t* active_nexus{ nullptr };
 
-        explicit ancestry_t(requirements_t&... refs) noexcept
-            : resources_t(refs...)
-        {
-        }
+        // Explicit control point to vaporize future pulses safely
+        void detach_t();
+
+        // Safe fallback for standard lifecycles
+        virtual ~catalyst_base_t();
+
+        // Type-erased execution hook
+        virtual void react_t(const void* pulse_ptr) = 0;
     };
 
     // ============================================================================
-    // 2. INTERNAL CONDUIT MECHANICS (ENGINE)
+    // 3. CORE ROUTING STRUCTURES
     // ============================================================================
 
-    using task_t = std::function<void()>;
+    struct route_slot_t {
+        std::atomic<catalyst_base_t*> target{ nullptr };
+        std::atomic<int32_t> in_flight{ 0 }; // Hardware fence counter
+    };
 
-    /// Single worker conduit: queue + worker thread + inertia tracking.
-    class conduit_internal_t
-    {
-    public:
-        conduit_internal_t()
-        {
-            worker_thread_t = std::thread([this] { process_flow_t(); });
-        }
+    // ============================================================================
+    // 4. INFRASTRUCTURE SCAFFOLDING
+    // ============================================================================
 
-        conduit_internal_t(const conduit_internal_t&) = delete;
-        conduit_internal_t& operator=(const conduit_internal_t&) = delete;
-        conduit_internal_t(conduit_internal_t&&) = delete;
-        conduit_internal_t& operator=(conduit_internal_t&&) = delete;
+    struct vessel_t {
+        size_t capacity;
+        explicit vessel_t(size_t c) : capacity(c) {}
+    };
 
-        ~conduit_internal_t()
-        {
-            {
-                std::lock_guard<std::mutex> lock(gatekeeper_t);
-                is_flowing_t.store(false, std::memory_order_release);
-            }
-            flow_signal_t.notify_one();
-            if (worker_thread_t.joinable())
-            {
-                worker_thread_t.join();
-            }
-        }
+    // Explicit Topology. 1 Conduit = 1 Thread + 1 Queue.
+    // Zero cross-thread contention.
+    struct conduit_internal_t {
+        std::thread worker;
+        std::vector<std::function<void()>> tasks;
+        std::mutex queue_mutex;
+        std::condition_variable condition;
+        std::atomic<bool> stop{ false };
 
-        /// Inject a task into this conduit.
-        void inject_t(task_t task)
-        {
-            {
-                std::lock_guard<std::mutex> lock(gatekeeper_t);
-                if (!is_flowing_t.load(std::memory_order_acquire))
-                {
-                    return;
-                }
-                flow_queue_t.push(std::move(task));
-            }
-            inertia_load_t.fetch_add(1, std::memory_order_release);
-            flow_signal_t.notify_one();
-        }
+        conduit_internal_t() {
+            worker = std::thread([this]() {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    std::function<void()> task;
 
-        /// Current number of in-flight tasks.
-        std::size_t get_inertia_t() const noexcept
-        {
-            return inertia_load_t.load(std::memory_order_acquire);
-        }
-
-        /// Block until the queue is empty.
-        void drain_t()
-        {
-            std::unique_lock<std::mutex> lock(gatekeeper_t);
-            flow_signal_t.wait(lock, [this] { return flow_queue_t.empty(); });
-        }
-
-        /// Stop accepting new tasks and let the worker exit once drained.
-        void close_t()
-        {
-            std::lock_guard<std::mutex> lock(gatekeeper_t);
-            is_flowing_t.store(false, std::memory_order_release);
-        }
-
-    private:
-        void process_flow_t()
-        {
-            for (;;)
-            {
-                task_t active_task_t;
-                {
-                    std::unique_lock<std::mutex> lock(gatekeeper_t);
-                    flow_signal_t.wait(lock, [this] {
-                        return !flow_queue_t.empty() ||
-                            !is_flowing_t.load(std::memory_order_acquire);
-                        });
-
-                    if (flow_queue_t.empty() &&
-                        !is_flowing_t.load(std::memory_order_acquire))
-                    {
-                        // Shutdown requested and queue is empty.
-                        return;
+                    // 1. FAST PATH: 32-iteration spin-loop
+                    // Avoids the massive latency of yielding to the OS under high load.
+                    bool found = false;
+                    for (int i = 0; i < 32; ++i) {
+                        if (queue_mutex.try_lock()) {
+                            if (!tasks.empty()) {
+                                task = std::move(tasks.front());
+                                tasks.erase(tasks.begin());
+                                found = true;
+                            }
+                            queue_mutex.unlock();
+                            if (found) break;
+                        }
+                        // C++20 standard yield to prevent burning CPU cache lines
+                        std::this_thread::yield();
                     }
 
-                    active_task_t = std::move(flow_queue_t.front());
-                    flow_queue_t.pop();
-                }
+                    // 2. SLOW PATH: OS sleep if spin fails (System is idle)
+                    if (!found) {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] { return stop.load() || !tasks.empty(); });
 
-                active_task_t();
-                inertia_load_t.fetch_sub(1, std::memory_order_release);
-                flow_signal_t.notify_all();
-            }
-        }
+                        if (stop.load() && tasks.empty()) return;
 
-        std::queue<task_t> flow_queue_t;
-        std::mutex gatekeeper_t;
-        std::condition_variable flow_signal_t;
-        std::atomic<std::size_t> inertia_load_t{ 0 };
-        std::atomic<bool> is_flowing_t{ true };
-        std::thread worker_thread_t;
-    };
-
-    // ============================================================================
-    // 3. INFRASTRUCTURE & TOPOLOGY (RAII PYRAMID)
-    // ============================================================================
-
-    /// Vessel: top-level capacity descriptor for a local execution topology.
-    class vessel_t
-    {
-    public:
-        explicit vessel_t(std::size_t cap) noexcept
-            : capacity_t(cap)
-        {
-        }
-
-        vessel_t(const vessel_t&) = delete;
-        vessel_t& operator=(const vessel_t&) = delete;
-        vessel_t(vessel_t&&) = delete;
-        vessel_t& operator=(vessel_t&&) = delete;
-
-        std::size_t get_capacity_t() const noexcept
-        {
-            return capacity_t;
-        }
-
-    private:
-        std::size_t capacity_t;
-    };
-
-    /// Conduits: fixed set of worker conduits owned by a vessel.
-    class conduits_t
-    {
-    public:
-        explicit conduits_t(vessel_t& parent)
-        {
-            for (std::size_t i = 0; i < parent.get_capacity_t(); ++i)
-            {
-                channels_t.push_back(std::make_unique<conduit_internal_t>());
-            }
-        }
-
-        conduits_t(const conduits_t&) = delete;
-        conduits_t& operator=(const conduits_t&) = delete;
-        conduits_t(conduits_t&&) = delete;
-        conduits_t& operator=(conduits_t&&) = delete;
-
-        std::size_t size_t_() const noexcept
-        {
-            return channels_t.size();
-        }
-
-        conduit_internal_t& get_t(std::size_t index)
-        {
-            return *channels_t[index];
-        }
-
-    private:
-        std::vector<std::unique_ptr<conduit_internal_t>> channels_t;
-    };
-
-    /// Valve: flow control over a conduits fabric (open/close/drain).
-    class valve_t
-    {
-    public:
-        explicit valve_t(conduits_t& conduits) noexcept
-            : target_t(conduits)
-        {
-        }
-
-        valve_t(const valve_t&) = delete;
-        valve_t& operator=(const valve_t&) = delete;
-        valve_t(valve_t&&) = delete;
-        valve_t& operator=(valve_t&&) = delete;
-
-        void open_t() noexcept
-        {
-            is_open_t.store(true, std::memory_order_release);
-        }
-
-        void close_t() noexcept
-        {
-            is_open_t.store(false, std::memory_order_release);
-            for (std::size_t i = 0; i < target_t.size_t_(); ++i)
-            {
-                target_t.get_t(i).close_t();
-            }
-        }
-
-        void drain_t() noexcept
-        {
-            for (std::size_t i = 0; i < target_t.size_t_(); ++i)
-            {
-                target_t.get_t(i).drain_t();
-            }
-        }
-
-        bool check_flow_t() const noexcept
-        {
-            return is_open_t.load(std::memory_order_acquire);
-        }
-
-    private:
-        conduits_t& target_t;
-        std::atomic<bool> is_open_t{ false };
-    };
-
-    // ============================================================================
-    // 4. DISTRIBUTED ROUTING & CATALYST REGISTRY (NEXUS)
-    // ============================================================================
-
-    class catalyst_base_t;
-
-    /// Nexus: routing entry point and catalyst registry.
-    class nexus_t
-    {
-    public:
-        struct config_t
-        {
-            std::string identity_t;
-            std::vector<std::string> lattice_t;
-        };
-
-        explicit nexus_t(conduits_t& conduits, config_t /*cfg*/) noexcept
-            : local_conduits_t(conduits)
-        {
-        }
-
-        nexus_t(const nexus_t&) = delete;
-        nexus_t& operator=(const nexus_t&) = delete;
-        nexus_t(nexus_t&&) = delete;
-        nexus_t& operator=(nexus_t&&) = delete;
-
-        void bind_catalyst_t(catalyst_base_t* cat_t)
-        {
-            std::lock_guard<std::mutex> lock(registry_lock_t);
-            local_catalysts_t.push_back(cat_t);
-        }
-
-        void unbind_catalyst_t(catalyst_base_t* cat_t)
-        {
-            std::lock_guard<std::mutex> lock(registry_lock_t);
-            for (auto it = local_catalysts_t.begin();
-                it != local_catalysts_t.end();
-                ++it)
-            {
-                if (*it == cat_t)
-                {
-                    local_catalysts_t.erase(it);
-                    break;
-                }
-            }
-        }
-
-        /// Broadcast a pulse using gravity routing (least loaded conduit).
-        template<typename derived_pulse_t>
-        void broadcast_t(const valve_t& valve, derived_pulse_t pulse)
-        {
-            if (!valve.check_flow_t())
-            {
-                return;
-            }
-
-            std::size_t best_index_t = 0;
-            std::size_t min_load_t = static_cast<std::size_t>(-1);
-
-            for (std::size_t i = 0; i < local_conduits_t.size_t_(); ++i)
-            {
-                std::size_t load = local_conduits_t.get_t(i).get_inertia_t();
-                if (load < min_load_t)
-                {
-                    min_load_t = load;
-                    best_index_t = i;
-                }
-            }
-
-            local_conduits_t.get_t(best_index_t).inject_t(
-                [this, pulse_copy = std::move(pulse)]() {
-                    std::lock_guard<std::mutex> lock(registry_lock_t);
-                    for (auto* cat : local_catalysts_t)
-                    {
-                        cat->react_t(pulse_copy);
+                        if (!tasks.empty()) {
+                            task = std::move(tasks.front());
+                            tasks.erase(tasks.begin());
+                        }
                     }
+
+                    // Execute the pulse completely lock-free
+                    if (task) task();
+                }
                 });
         }
 
+        template<typename F>
+        void inject_t(F&& func) {
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                tasks.emplace_back(std::forward<F>(func));
+            }
+            condition.notify_one();
+        }
+
+        // Safe, deterministic teardown. No aborted ghost threads.
+        ~conduit_internal_t() {
+            stop.store(true, std::memory_order_relaxed);
+            condition.notify_all();
+            if (worker.joinable()) worker.join();
+        }
+    };
+
+    struct conduits_t {
+        vessel_t& vessel;
+        // Pointers used so mutexes/threads don't invalidate on vector resize
+        std::vector<std::unique_ptr<conduit_internal_t>> lanes;
+
+        explicit conduits_t(vessel_t& v) : vessel(v) {
+            for (size_t i = 0; i < vessel.capacity; ++i) {
+                lanes.push_back(std::make_unique<conduit_internal_t>());
+            }
+        }
+
+        // O(1) Data Affinity Dispatch.
+        conduit_internal_t& get_t(size_t index) {
+            return *lanes[index % lanes.size()];
+        }
+    };
+
+    struct valve_t {
+        conduits_t& conduits;
+        std::atomic<bool> is_open{ false };
+
+        explicit valve_t(conduits_t& c) : conduits(c) {}
+        void open_t() { is_open.store(true, std::memory_order_release); }
+        void close_t() { is_open.store(false, std::memory_order_release); }
+        bool check_flow_t() const { return is_open.load(std::memory_order_acquire); }
+
+        void drain_t() {
+            // Yield until all lane queues are physically empty
+            for (auto& lane : conduits.lanes) {
+                while (true) {
+                    bool empty = false;
+                    {
+                        std::lock_guard<std::mutex> lock(lane->queue_mutex);
+                        empty = lane->tasks.empty();
+                    }
+                    if (empty) break;
+                    std::this_thread::yield();
+                }
+            }
+        }
+    };
+
+    // ============================================================================
+    // 5. THE NEXUS (Lock-Free Event Fabric)
+    // ============================================================================
+
+    class nexus_t {
+    public:
+        struct config_t {
+            std::string name;
+            std::vector<std::string> options;
+        };
+
     private:
         conduits_t& local_conduits_t;
-        std::mutex registry_lock_t;
-        std::vector<catalyst_base_t*> local_catalysts_t;
-    };
+        config_t config;
 
-    /// Hub: domain boundary over a nexus.
-    class hub_t
-    {
+        static constexpr size_t MAX_CATALYSTS = 1024;
+        route_slot_t registry_t[MAX_CATALYSTS];
+
     public:
-        explicit hub_t(nexus_t& n) noexcept
-            : parent_nexus_t(n)
-        {
+        nexus_t(conduits_t& conduits, config_t cfg)
+            : local_conduits_t(conduits), config(std::move(cfg)) {
         }
 
-        hub_t(const hub_t&) = delete;
-        hub_t& operator=(const hub_t&) = delete;
-        hub_t(hub_t&&) = delete;
-        hub_t& operator=(hub_t&&) = delete;
+        void bind_catalyst_t(catalyst_base_t* cat);
+        void unbind_catalyst_t(catalyst_base_t* cat);
 
-        nexus_t& get_nexus_t() const noexcept
-        {
-            return parent_nexus_t;
+        template<typename derived_pulse_t>
+        void broadcast_t(const valve_t& valve, derived_pulse_t pulse) {
+            if (!valve.check_flow_t()) return;
+
+            // For general pulses, hash the this pointer or use a round-robin metric. 
+            // We will default to lane 0 for this minimal example if no key is provided.
+            size_t best_index_t = 0;
+
+            local_conduits_t.get_t(best_index_t).inject_t(
+                [this, pulse_copy = std::move(pulse)]() {
+                    // Lock-Free O(1) Execution Path
+                    for (auto& slot : registry_t) {
+
+                        slot.in_flight.fetch_add(1, std::memory_order_acquire);
+
+                        if (auto* cat = slot.target.load(std::memory_order_relaxed)) {
+                            cat->react_t(&pulse_copy);
+                        }
+
+                        slot.in_flight.fetch_sub(1, std::memory_order_release);
+                    }
+                });
         }
-
-    private:
-        nexus_t& parent_nexus_t;
-    };
-
-    /// Catalysts: RAII handle for registering reactions into a hub.
-    class catalysts_t
-    {
-    public:
-        explicit catalysts_t(hub_t& h) noexcept
-            : parent_hub_t(h)
-        {
-        }
-
-        catalysts_t(const catalysts_t&) = delete;
-        catalysts_t& operator=(const catalysts_t&) = delete;
-        catalysts_t(catalysts_t&&) = delete;
-        catalysts_t& operator=(catalysts_t&&) = delete;
-
-        nexus_t& get_nexus_t() const noexcept
-        {
-            return parent_hub_t.get_nexus_t();
-        }
-
-    private:
-        hub_t& parent_hub_t;
     };
 
     // ============================================================================
-    // 5. BEHAVIORAL INTERFACES (REACTION MODEL)
+    // 6. TOPOLOGY HANDLES (Hubs & Pools)
     // ============================================================================
 
-    /// Base class for all catalysts registered into a catalysts_t pool.
-    class catalyst_base_t
-    {
-    public:
-        explicit catalyst_base_t(catalysts_t& pool_t) noexcept
-            : pool_ref_t(pool_t)
-        {
-            pool_ref_t.get_nexus_t().bind_catalyst_t(this);
-        }
-
-        catalyst_base_t(const catalyst_base_t&) = delete;
-        catalyst_base_t& operator=(const catalyst_base_t&) = delete;
-        catalyst_base_t(catalyst_base_t&&) = delete;
-        catalyst_base_t& operator=(catalyst_base_t&&) = delete;
-
-        virtual ~catalyst_base_t()
-        {
-            pool_ref_t.get_nexus_t().unbind_catalyst_t(this);
-        }
-
-        virtual void react_t(const pulse_base_t& signal_t) = 0;
-
-    protected:
-        catalysts_t& pool_ref_t;
+    struct hub_t {
+        nexus_t& parent_nexus;
+        explicit hub_t(nexus_t& n) : parent_nexus(n) {}
     };
 
-    /// CRTP reaction: type-safe dispatch over handled pulse types.
-    template<typename derived_t, typename... handled_pulses_t>
-    class reaction_t : public catalyst_base_t
-    {
-    public:
-        explicit reaction_t(catalysts_t& pool_t) noexcept
-            : catalyst_base_t(pool_t)
-        {
+    struct catalysts_t {
+        hub_t& parent_hub;
+        explicit catalysts_t(hub_t& h) : parent_hub(h) {}
+        nexus_t& get_nexus_t() const { return parent_hub.parent_nexus; }
+    };
+
+    template <typename derived_t, typename pulse_type_t>
+    struct reaction_t : catalyst_base_t {
+        explicit reaction_t(catalysts_t& pool) noexcept {
+            pool.get_nexus_t().bind_catalyst_t(this);
         }
 
-        void react_t(const pulse_base_t& signal_t) final
-        {
-            (attempt_reaction_t<handled_pulses_t>(signal_t) || ...);
+        void react_t(const void* pulse_ptr) override {
+            // Safely cast back to the derived pulse type
+            static_cast<derived_t*>(this)->respond_t(
+                *static_cast<const pulse_type_t*>(pulse_ptr)
+            );
         }
+    };
 
-    private:
-        template<typename specific_pulse_t>
-        bool attempt_reaction_t(const pulse_base_t& signal_t)
-        {
-            if (signal_t.signature_t() == typeid(specific_pulse_t))
-            {
-                static_cast<derived_t*>(this)->respond_t(
-                    static_cast<const specific_pulse_t&>(signal_t));
-                return true;
+    // ============================================================================
+    // 7. SUPPLEMENTAL AUTOMATION LAYER
+    // ============================================================================
+
+    // Encapsulates the Operational Phase to eliminate manual drains
+    struct operational_scope_t {
+        valve_t& active_valve;
+        explicit operational_scope_t(valve_t& v) noexcept : active_valve(v) {}
+        ~operational_scope_t() { active_valve.drain_t(); }
+        operator valve_t& () { return active_valve; }
+        operator const valve_t& () const { return active_valve; }
+    };
+
+    // Structurally guarantees lock-free detachment before map destruction
+    template<typename handler_t>
+    struct route_guard_t {
+        handler_t& target;
+        explicit route_guard_t(handler_t& h) noexcept : target(h) {}
+        ~route_guard_t() { target.detach_t(); }
+    };
+
+    // ============================================================================
+    // 8. IMPLEMENTATION TAIL
+    // ============================================================================
+
+    inline void catalyst_base_t::detach_t() {
+        if (!is_detached.exchange(true, std::memory_order_acq_rel)) {
+            if (active_nexus) {
+                active_nexus->unbind_catalyst_t(this);
             }
-            return false;
         }
-    };
+    }
+
+    inline catalyst_base_t::~catalyst_base_t() {
+        detach_t();
+    }
+
+    inline void nexus_t::bind_catalyst_t(catalyst_base_t* cat) {
+        for (auto& slot : registry_t) {
+            catalyst_base_t* expected = nullptr;
+            if (slot.target.compare_exchange_strong(expected, cat)) {
+                cat->active_nexus = this; // Establish explicit physical link
+                return;
+            }
+        }
+    }
+
+    inline void nexus_t::unbind_catalyst_t(catalyst_base_t* cat) {
+        for (auto& slot : registry_t) {
+            if (slot.target.load(std::memory_order_relaxed) == cat) {
+                // 1. Vaporize future events
+                slot.target.store(nullptr, std::memory_order_release);
+
+                // 2. Hardware fence: Wait ONLY if a thread is physically executing right now
+                while (slot.in_flight.load(std::memory_order_acquire) > 0) {
+                    std::this_thread::yield();
+                }
+                return;
+            }
+        }
+    }
 
 } // namespace flux_t

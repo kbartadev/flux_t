@@ -24,10 +24,10 @@ flux_t uses an evocative terminology to describe its internal "anatomy":
 flux_t relies on a strictly layered hierarchy. Each component owns or references the layer beneath it, ensuring a safe and predictable teardown:
 
 * **vessel_t**: Defines the requested thread capacity.
-* **conduits_t** & **conduit_internal_t**: The engine. conduits_t allocates the worker threads, each managing its own std::thread and mutex-guarded task queue.
+* **conduits_t & conduit_internal_t**: The engine. conduits_t allocates the worker threads, each managing its own std::thread and mutex-guarded task queue.
 * **valve_t**: Provides explicit control to toggle flow (open_t, close_t, or drain_t).
 * **nexus_t**: The central router. It dispatches pulses via O(1) modulo hashing and maintains the handler registry.
-* **hub_t** & **catalysts_t**: RAII boundaries that bind message handlers to a specific hierarchical lifetime.
+* **hub_t & catalysts_t**: RAII boundaries that bind message handlers to a specific hierarchical lifetime.
 * **reaction_t**: User-defined logic. They register with the nexus_t via the catalysts_t scope on construction and deregister on destruction.
 
 ### 4. Truth in Engineering
@@ -74,15 +74,16 @@ struct printer_t : flux_t::reaction_t<printer_t, my_pulse> {
 int main() {
     flux_t::vessel_t vessel{4};           
     flux_t::conduits_t conduits{vessel};  
-    flux_t::valve_t valve{conduits};      
-    flux_t::nexus_t nexus{valve};         
+    flux_t::valve_t valve{conduits};
+    flux_t::nexus_t::config_t cfg{ "local", {} };
+    flux_t::nexus_t nexus{conduits, cfg};
     flux_t::hub_t hub{nexus};             
     flux_t::catalysts_t pool{hub};        
 
     printer_t printer{pool};
 
     valve.open_t();
-    nexus.broadcast_t(my_pulse{42}); 
+    nexus.broadcast_t<my_pulse>(valve, my_pulse{42});
     valve.drain_t(); 
 
     return 0; // Stack unwinds: printer deregisters -> threads join
@@ -111,17 +112,26 @@ struct user_tracker_t : flux_t::reaction_t<user_tracker_t, user_pulse> {
 };
 ```
 
-#### 3. Nested Scoping
-Handlers automatically deregister when their local catalysts_t scope is destroyed.
+## 3. Transient Scoping (Seamless Detachment)
+Handlers automatically decouple when their scope ends. Using route_guard_t guarantees that the local handler safely disconnects from the network on exit. Because the topology is strictly decoupled, pulses emitted within the temporary scope continue flowing through the parent network flawlessly, leaving the global application completely uninterrupted.
 
-```cpp
 {
     flux_t::hub_t local_hub{nexus};
     flux_t::catalysts_t local_pool{local_hub};
 
     temp_handler_t h1{local_pool};
-    nexus.broadcast_t(some_pulse{});
-} // h1 deregisters here; the parent nexus/conduits remain active.
+    
+    // Automation Layer: structurally guarantees lock-free detachment on exit
+    flux_t::route_guard_t guard{h1};
+
+    // This pulse is injected into the global tissue. 
+    // It will propagate to the broader network even after this scope closes.
+    nexus.broadcast_t(valve, some_pulse{});
+
+} // Stack unwinds safely:
+  // 1. guard detaches h1 from the routing table lock-free.
+  // 2. h1 is safely destroyed.
+  // The global valve and parent nexus never stop flowing.
 ```
 
 ---
