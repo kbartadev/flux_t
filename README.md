@@ -115,6 +115,7 @@ struct user_tracker_t : flux_t::reaction_t<user_tracker_t, user_pulse> {
 ## 3. Transient Scoping (Seamless Detachment)
 Handlers automatically decouple when their scope ends. Using route_guard_t guarantees that the local handler safely disconnects from the network on exit. Because the topology is strictly decoupled, pulses emitted within the temporary scope continue flowing through the parent network flawlessly, leaving the global application completely uninterrupted.
 
+```cpp
 {
     flux_t::hub_t local_hub{nexus};
     flux_t::catalysts_t local_pool{local_hub};
