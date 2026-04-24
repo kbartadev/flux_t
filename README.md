@@ -74,15 +74,16 @@ struct printer_t : flux_t::reaction_t<printer_t, my_pulse> {
 int main() {
     flux_t::vessel_t vessel{4};           
     flux_t::conduits_t conduits{vessel};  
-    flux_t::valve_t valve{conduits};      
-    flux_t::nexus_t nexus{valve};         
+    flux_t::valve_t valve{conduits};
+    flux_t::nexus_t::config_t cfg{ "local", {} };
+    flux_t::nexus_t nexus{conduits, cfg};
     flux_t::hub_t hub{nexus};             
     flux_t::catalysts_t pool{hub};        
 
     printer_t printer{pool};
 
     valve.open_t();
-    nexus.broadcast_t(my_pulse{42}); 
+    nexus.broadcast_t<my_pulse>(valve, my_pulse{42});
     valve.drain_t(); 
 
     return 0; // Stack unwinds: printer deregisters -> threads join
